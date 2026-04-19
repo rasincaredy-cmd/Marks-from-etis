@@ -16,7 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 from etis_parser import ETISParser, GRADES_URL
-from storage import UserStorage
+from storage import UserStorage, get_pool, init_db
 from monitor import GradeMonitor
 
 logging.basicConfig(
@@ -25,17 +25,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=config.BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-storage = UserStorage()
-monitor = GradeMonitor(bot, storage)
+bot     = Bot(token=config.BOT_TOKEN)
+dp      = Dispatcher(storage=MemoryStorage())
+storage: UserStorage = None   # инициализируется в main()
+monitor: GradeMonitor = None
 
-# Кэш авторизованных парсеров — каждый хранит HTTP-сессию с куками
+# id администратора — читается из переменной окружения ADMIN_ID
+import os
+ADMIN_ID: int = int(os.environ.get("ADMIN_ID", "0"))
+
+# Кэш авторизованных парсеров
 _parsers: dict[int, ETISParser] = {}
 
-# id «лишних» сообщений-чанков (когда текст не влез в одно сообщение)
-# Структура: {user_id: {"anchor_id": int, "extra_ids": [int, ...]}}
-# anchor_id — id первого сообщения блока (то, в которое делается edit)
+# Лишние чанки длинных сообщений
 _chunks: dict[int, dict] = {}
 
 
@@ -48,6 +50,10 @@ class LoginStates(StatesGroup):
 class MonitorStates(StatesGroup):
     waiting_interval  = State()
     waiting_whitelist = State()
+
+class AdminStates(StatesGroup):
+    waiting_send_id   = State()
+    waiting_send_text = State()
 
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
@@ -132,12 +138,14 @@ def back_kb(target: str = "main_menu") -> InlineKeyboardMarkup:
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
 async def ensure_logged_in(user_id: int) -> ETISParser | None:
-    """Возвращает авторизованный парсер. Переиспользует сессию, при необходимости логинится заново."""
-    creds = storage.get_credentials(user_id)
+    creds = await storage.get_credentials(user_id)
     if not creds:
         return None
-
     parser = _parsers.get(user_id)
     if parser:
         try:
@@ -148,7 +156,6 @@ async def ensure_logged_in(user_id: int) -> ETISParser | None:
             pass
         await parser.close()
         _parsers.pop(user_id, None)
-
     parser = ETISParser()
     if await parser.login(creds["login"], creds["password"]):
         _parsers[user_id] = parser
@@ -173,21 +180,19 @@ def _split_text(text: str, limit: int = 4000) -> list[str]:
     return parts
 
 
-async def _safe_edit(message, text: str, **kwargs):
-    """edit_text с защитой от 'message not found' и 'message not modified'."""
+async def _safe_edit(message, text: str, **kwargs) -> bool:
     try:
         await message.edit_text(text, **kwargs)
         return True
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
-            return True   # визуально всё ок, тихо игнорируем
+            return True
         if "message to edit not found" in str(e):
-            return False  # сообщение пропало — нужно отправить новое
+            return False
         raise
 
 
 async def _clear_extra_chunks(user_id: int, chat_id: int):
-    """Удаляет все лишние чанки предыдущего длинного сообщения."""
     info = _chunks.pop(user_id, None)
     if not info:
         return
@@ -199,29 +204,20 @@ async def _clear_extra_chunks(user_id: int, chat_id: int):
 
 
 async def _send_long(cb: CallbackQuery, text: str, final_kb: InlineKeyboardMarkup):
-    """
-    Отправляет длинный текст.
-    - Сначала удаляет старые лишние чанки.
-    - Первый чанк: пытается редактировать cb.message; если оно пропало — отправляет новое.
-    - Остальные чанки: всегда новые сообщения, их id сохраняются для последующей очистки.
-    """
     user_id = cb.from_user.id
     chat_id = cb.message.chat.id
-
     await _clear_extra_chunks(user_id, chat_id)
 
     chunks = _split_text(text)
     extra_ids: list[int] = []
-    anchor_message = cb.message  # сообщение для первого чанка
+    anchor_message = cb.message
 
     for i, chunk in enumerate(chunks):
         is_last = (i == len(chunks) - 1)
         kb = final_kb if is_last else None
-
         if i == 0:
             ok = await _safe_edit(anchor_message, chunk, parse_mode="Markdown", reply_markup=kb)
             if not ok:
-                # Сообщение исчезло — отправляем новое
                 sent = await cb.message.answer(chunk, parse_mode="Markdown", reply_markup=kb)
                 anchor_message = sent
         else:
@@ -234,14 +230,11 @@ async def _send_long(cb: CallbackQuery, text: str, final_kb: InlineKeyboardMarku
 
 async def _send_menu(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
                      state: FSMContext | None = None):
-    """Отправляет одиночное меню-сообщение, очищает лишние чанки и FSM."""
     user_id = cb.from_user.id
     chat_id = cb.message.chat.id
-
     await _clear_extra_chunks(user_id, chat_id)
     if state:
         await state.clear()
-
     try:
         await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
     except TelegramBadRequest as e:
@@ -259,6 +252,11 @@ async def _send_menu(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup,
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    await storage.ensure_user(
+        message.from_user.id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+    )
     await message.answer("Главное меню ЕТИС-бота 🎓", reply_markup=main_menu_kb())
 
 
@@ -305,15 +303,15 @@ async def process_password(message: Message, state: FSMContext):
     parser = ETISParser()
     ok = await parser.login(login, password)
     if ok:
-        # Кэшируем парсер сразу — сессия уже активна
         _parsers[message.from_user.id] = parser
-        storage.save_credentials(message.from_user.id, login, password)
+        await storage.save_credentials(message.from_user.id, login, password)
         await state.clear()
         await message.answer("✅ Авторизация прошла успешно!", reply_markup=main_menu_kb())
     else:
         await parser.close()
         await state.clear()
-        await message.answer("❌ Ошибка авторизации. Проверьте логин и пароль.", reply_markup=main_menu_kb())
+        await message.answer("❌ Ошибка авторизации. Проверьте логин и пароль.",
+                             reply_markup=main_menu_kb())
 
 
 # ─── Grades ───────────────────────────────────────────────────────────────────
@@ -335,12 +333,10 @@ async def cb_grades_term(cb: CallbackQuery):
 
 
 async def _show_grades(cb: CallbackQuery, term: int | None):
-    # Сначала очищаем старые чанки и показываем лоадер
     await _clear_extra_chunks(cb.from_user.id, cb.message.chat.id)
     ok = await _safe_edit(cb.message, "⏳ Загружаю оценки...")
     if not ok:
         msg = await cb.message.answer("⏳ Загружаю оценки...")
-        # Подменяем cb.message чтобы дальше редактировать правильное сообщение
         cb = cb.model_copy(update={"message": msg})
     await cb.answer()
 
@@ -361,7 +357,7 @@ async def _show_grades(cb: CallbackQuery, term: int | None):
         await _safe_edit(cb.message, "📭 Оценок не найдено.", reply_markup=grades_kb())
         return
 
-    ds = storage.get_display_settings(cb.from_user.id)
+    ds = await storage.get_display_settings(cb.from_user.id)
     show_theme        = ds.get("show_theme", False)
     show_work_type    = ds.get("show_work_type", False)
     show_control_type = ds.get("show_control_type", False)
@@ -377,11 +373,10 @@ async def _show_grades(cb: CallbackQuery, term: int | None):
             r_str = str(row["rating_score"]) if row.get("rating_score") is not None else "—"
             m_str = str(row["max_score"])    if row.get("max_score")    is not None else "—"
             p_str = str(row["passing_score"])if row.get("passing_score")is not None else "—"
-
             line = f"  КТ{i}: {r_str}/{m_str} (проход: {p_str})"
             if show_work_type    and row.get("work_type"):    line += f" | {row['work_type']}"
             if show_control_type and row.get("control_type"): line += f" | {row['control_type']}"
-            if row.get("date"):  line += f" {row['date']}"
+            if row.get("date"):   line += f" {row['date']}"
             if row.get("is_red"): line += " ⚠️"
             text += line + "\n"
             if show_theme and row.get("theme"):
@@ -434,7 +429,7 @@ async def _show_timetable(cb: CallbackQuery, week: int | None):
                          reply_markup=timetable_nav_kb(current_week))
         return
 
-    ds = storage.get_display_settings(cb.from_user.id)
+    ds = await storage.get_display_settings(cb.from_user.id)
     hide_cons = ds.get("hide_consultations", False)
 
     text = f"📅 *Расписание — {week_label}*\n\n"
@@ -458,7 +453,7 @@ async def _show_timetable(cb: CallbackQuery, week: int | None):
 
 @dp.callback_query(F.data == "grades_settings")
 async def cb_grades_settings(cb: CallbackQuery):
-    s = storage.get_display_settings(cb.from_user.id)
+    s = await storage.get_display_settings(cb.from_user.id)
     await _send_menu(cb,
         "⚙️ *Настройки отображения оценок*\n\nВключи что хочешь видеть у каждой КТ:",
         grades_settings_kb(s))
@@ -467,9 +462,9 @@ async def cb_grades_settings(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("gs_toggle_"))
 async def cb_gs_toggle(cb: CallbackQuery):
     key = cb.data.removeprefix("gs_toggle_")
-    s = storage.get_display_settings(cb.from_user.id)
+    s = await storage.get_display_settings(cb.from_user.id)
     s[key] = not s.get(key, False)
-    storage.set_display_settings(cb.from_user.id, s)
+    await storage.set_display_settings(cb.from_user.id, s)
     try:
         await cb.message.edit_reply_markup(reply_markup=grades_settings_kb(s))
     except TelegramBadRequest:
@@ -479,16 +474,16 @@ async def cb_gs_toggle(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "timetable_settings")
 async def cb_timetable_settings(cb: CallbackQuery):
-    s = storage.get_display_settings(cb.from_user.id)
+    s = await storage.get_display_settings(cb.from_user.id)
     await _send_menu(cb, "⚙️ *Настройки отображения расписания*", timetable_settings_kb(s))
 
 
 @dp.callback_query(F.data.startswith("ts_toggle_"))
 async def cb_ts_toggle(cb: CallbackQuery):
     key = cb.data.removeprefix("ts_toggle_")
-    s = storage.get_display_settings(cb.from_user.id)
+    s = await storage.get_display_settings(cb.from_user.id)
     s[key] = not s.get(key, False)
-    storage.set_display_settings(cb.from_user.id, s)
+    await storage.set_display_settings(cb.from_user.id, s)
     try:
         await cb.message.edit_reply_markup(reply_markup=timetable_settings_kb(s))
     except TelegramBadRequest:
@@ -508,7 +503,7 @@ async def cb_monitor_menu(cb: CallbackQuery):
 @dp.callback_query(F.data == "monitor_start")
 async def cb_monitor_start(cb: CallbackQuery):
     user_id = cb.from_user.id
-    if not storage.get_credentials(user_id):
+    if not await storage.get_credentials(user_id):
         await cb.answer("❌ Сначала войдите в ЕТИС!", show_alert=True)
         return
     monitor.start(user_id)
@@ -524,12 +519,10 @@ async def cb_monitor_stop(cb: CallbackQuery):
 @dp.callback_query(F.data == "monitor_status")
 async def cb_monitor_status(cb: CallbackQuery):
     user_id = cb.from_user.id
-    cfg     = storage.get_monitor_config(user_id)
+    cfg     = await storage.get_monitor_config(user_id)
     active  = monitor.is_active(user_id)
-
     last_ts = cfg.get("last_check")
     last_str = datetime.fromtimestamp(last_ts).strftime("%d.%m.%Y %H:%M:%S") if last_ts else "ещё не было"
-
     text = (
         f"📋 *Настройки мониторинга*\n\n"
         f"Статус: {'🟢 активен' if active else '🔴 остановлен'}\n"
@@ -557,7 +550,7 @@ async def process_interval(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите целое число минут (минимум 1).")
         return
-    storage.set_monitor_config(message.from_user.id, interval_minutes=minutes)
+    await storage.set_monitor_config(message.from_user.id, interval_minutes=minutes)
     await state.clear()
     await message.answer(
         f"✅ Интервал установлен: каждые *{minutes}* мин.",
@@ -581,14 +574,13 @@ async def cb_monitor_set_whitelist(cb: CallbackQuery, state: FSMContext):
 async def process_whitelist(message: Message, state: FSMContext):
     raw = message.text.strip()
     if raw == "-":
-        storage.set_monitor_config(message.from_user.id, whitelist="")
+        await storage.set_monitor_config(message.from_user.id, whitelist="")
         await state.clear()
         await message.answer(
             "✅ Временное окно убрано — мониторинг работает круглосуточно.",
             reply_markup=monitor_menu_kb(message.from_user.id)
         )
         return
-
     pattern = r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}(,\d{1,2}:\d{2}-\d{1,2}:\d{2})*$"
     if not re.match(pattern, raw):
         await message.answer(
@@ -596,8 +588,7 @@ async def process_whitelist(message: Message, state: FSMContext):
             parse_mode="Markdown"
         )
         return
-
-    storage.set_monitor_config(message.from_user.id, whitelist=raw)
+    await storage.set_monitor_config(message.from_user.id, whitelist=raw)
     await state.clear()
     await message.answer(
         f"✅ Временное окно установлено: *{raw}*",
@@ -606,11 +597,73 @@ async def process_whitelist(message: Message, state: FSMContext):
     )
 
 
+# ─── Admin ────────────────────────────────────────────────────────────────────
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    users = await storage.all_users_info()
+    if not users:
+        await message.answer("Пользователей нет.")
+        return
+    lines = [f"👥 *Пользователи ({len(users)}):*\n"]
+    for u in users:
+        uid  = u["user_id"]
+        name = u.get("first_name") or ""
+        uname = f"@{u['username']}" if u.get("username") else "нет username"
+        dt = u["created_at"].strftime("%d.%m.%Y %H:%M") if u.get("created_at") else ""
+        lines.append(f"`{uid}` {name} {uname} — {dt}")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("send"))
+async def cmd_send(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Введите user\\_id получателя:", parse_mode="Markdown")
+    await state.set_state(AdminStates.waiting_send_id)
+
+
+@dp.message(AdminStates.waiting_send_id)
+async def process_send_id(message: Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите числовой user_id.")
+        return
+    await state.update_data(target_id=uid)
+    await message.answer("Введите текст сообщения:")
+    await state.set_state(AdminStates.waiting_send_text)
+
+
+@dp.message(AdminStates.waiting_send_text)
+async def process_send_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data["target_id"]
+    await state.clear()
+    try:
+        await bot.send_message(target_id, message.text)
+        await message.answer(f"✅ Отправлено пользователю `{target_id}`", parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить: {e}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    logger.info("Starting ETIS bot...")
+    global storage, monitor
+
+    logger.info("Connecting to database...")
+    pool = await get_pool()
+    await init_db(pool)
+    logger.info("Database ready")
+
+    storage = UserStorage(pool)
+    monitor = GradeMonitor(bot, storage)
+
     await monitor.restore_active_monitors()
+    logger.info("Starting ETIS bot...")
     await dp.start_polling(bot, skip_updates=True)
 
 

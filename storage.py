@@ -1,66 +1,123 @@
 """
-Simple JSON file storage for credentials and monitor config.
-No external DB needed — perfect for a personal bot.
+Storage — PostgreSQL бэкенд.
+Все данные живут в БД, не теряются при редеплое.
+
+Railway: Add Service → Database → PostgreSQL
+Переменная DATABASE_URL подставляется Railway автоматически.
 """
 
 import json
 import logging
-from pathlib import Path
+import os
 from typing import Optional
+
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
 
-USERS_FILE = DATA_DIR / "users.json"
-MONITOR_FILE = DATA_DIR / "monitor.json"
+
+async def get_pool() -> asyncpg.Pool:
+    """Создаёт пул соединений. Вызывается один раз при старте бота."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL не задан.\n"
+            "Railway: Add Service → Database → PostgreSQL — URL подставится автоматически."
+        )
+    return await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+
+async def init_db(pool: asyncpg.Pool):
+    """Создаёт таблицы если их нет."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id     BIGINT PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                login       TEXT,
+                password    TEXT,
+                display_settings  JSONB NOT NULL DEFAULT '{}',
+                grades_snapshot   JSONB NOT NULL DEFAULT '{}',
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS monitor (
+                user_id           BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+                interval_minutes  INT  NOT NULL DEFAULT 15,
+                whitelist         TEXT NOT NULL DEFAULT '',
+                active            BOOL NOT NULL DEFAULT FALSE,
+                last_check        DOUBLE PRECISION
+            )
+        """)
 
 
 class UserStorage:
-    def __init__(self):
-        self._users: dict = self._load(USERS_FILE)
-        self._monitor: dict = self._load(MONITOR_FILE)
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
 
-    # ── Persist ───────────────────────────────────────────────────────────────
+    # ── Регистрация пользователя ──────────────────────────────────────────────
 
-    @staticmethod
-    def _load(path: Path) -> dict:
-        if path.exists():
-            try:
-                return json.loads(path.read_text("utf-8"))
-            except Exception as e:
-                logger.error("Failed to load %s: %s", path, e)
-        return {}
-
-    def _save_users(self):
-        USERS_FILE.write_text(json.dumps(self._users, ensure_ascii=False, indent=2), "utf-8")
-
-    def _save_monitor(self):
-        MONITOR_FILE.write_text(json.dumps(self._monitor, ensure_ascii=False, indent=2), "utf-8")
+    async def ensure_user(self, user_id: int, username: str | None = None,
+                          first_name: str | None = None):
+        """Создаёт запись пользователя если её нет. Обновляет username/first_name."""
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, username, first_name)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET username   = COALESCE(EXCLUDED.username,   users.username),
+                        first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                        updated_at = NOW()
+            """, user_id, username, first_name)
 
     # ── Credentials ───────────────────────────────────────────────────────────
 
-    def save_credentials(self, user_id: int, login: str, password: str):
-        key = str(user_id)
-        if key not in self._users:
-            self._users[key] = {}
-        self._users[key]["login"] = login
-        self._users[key]["password"] = password
-        self._save_users()
+    async def save_credentials(self, user_id: int, login: str, password: str):
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, login, password)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET login    = EXCLUDED.login,
+                        password = EXCLUDED.password,
+                        updated_at = NOW()
+            """, user_id, login, password)
 
-    def get_credentials(self, user_id: int) -> Optional[dict]:
-        data = self._users.get(str(user_id), {})
-        if "login" in data and "password" in data:
-            return {"login": data["login"], "password": data["password"]}
+    async def get_credentials(self, user_id: int) -> Optional[dict]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT login, password FROM users WHERE user_id = $1", user_id
+            )
+        if row and row["login"] and row["password"]:
+            return {"login": row["login"], "password": row["password"]}
         return None
 
-    def all_user_ids(self) -> list[int]:
-        return [int(k) for k in self._users.keys()]
+    async def all_user_ids(self) -> list[int]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id FROM users")
+        return [r["user_id"] for r in rows]
+
+    async def all_users_info(self) -> list[dict]:
+        """Все пользователи с username/first_name — для команды /users."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id, username, first_name, created_at FROM users ORDER BY created_at"
+            )
+        return [dict(r) for r in rows]
 
     # ── Monitor config ────────────────────────────────────────────────────────
 
-    def set_monitor_config(
+    async def _ensure_monitor_row(self, conn, user_id: int):
+        await conn.execute("""
+            INSERT INTO monitor (user_id) VALUES ($1)
+            ON CONFLICT DO NOTHING
+        """, user_id)
+
+    async def set_monitor_config(
         self,
         user_id: int,
         *,
@@ -68,51 +125,81 @@ class UserStorage:
         whitelist: str | None = None,
         active: bool | None = None,
     ):
-        key = str(user_id)
-        if key not in self._monitor:
-            self._monitor[key] = {"interval_minutes": 15, "whitelist": "", "active": False}
-        if interval_minutes is not None:
-            self._monitor[key]["interval_minutes"] = interval_minutes
-        if whitelist is not None:
-            self._monitor[key]["whitelist"] = whitelist
-        if active is not None:
-            self._monitor[key]["active"] = active
-        self._save_monitor()
+        async with self._pool.acquire() as conn:
+            await self._ensure_monitor_row(conn, user_id)
+            if interval_minutes is not None:
+                await conn.execute(
+                    "UPDATE monitor SET interval_minutes=$1 WHERE user_id=$2",
+                    interval_minutes, user_id
+                )
+            if whitelist is not None:
+                await conn.execute(
+                    "UPDATE monitor SET whitelist=$1 WHERE user_id=$2",
+                    whitelist, user_id
+                )
+            if active is not None:
+                await conn.execute(
+                    "UPDATE monitor SET active=$1 WHERE user_id=$2",
+                    active, user_id
+                )
 
-    def get_monitor_config(self, user_id: int) -> dict:
-        return self._monitor.get(str(user_id), {
-            "interval_minutes": 15, "whitelist": "", "active": False
-        })
+    async def get_monitor_config(self, user_id: int) -> dict:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM monitor WHERE user_id=$1", user_id
+            )
+        if row:
+            return dict(row)
+        return {"interval_minutes": 15, "whitelist": "", "active": False, "last_check": None}
 
+    async def set_last_check(self, user_id: int, timestamp: float):
+        async with self._pool.acquire() as conn:
+            await self._ensure_monitor_row(conn, user_id)
+            await conn.execute(
+                "UPDATE monitor SET last_check=$1 WHERE user_id=$2",
+                timestamp, user_id
+            )
 
+    # ── Grades snapshot ───────────────────────────────────────────────────────
 
-    def save_grades_snapshot(self, user_id: int, snapshot: dict):
-        key = str(user_id)
-        if key not in self._users:
-            self._users[key] = {}
-        self._users[key]["grades_snapshot"] = snapshot
-        self._save_users()
+    async def save_grades_snapshot(self, user_id: int, snapshot: dict):
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, grades_snapshot)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET grades_snapshot = EXCLUDED.grades_snapshot,
+                        updated_at = NOW()
+            """, user_id, json.dumps(snapshot, ensure_ascii=False))
 
-    def get_grades_snapshot(self, user_id: int) -> dict:
-        return self._users.get(str(user_id), {}).get("grades_snapshot", {})
+    async def get_grades_snapshot(self, user_id: int) -> dict:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT grades_snapshot FROM users WHERE user_id=$1", user_id
+            )
+        if row and row["grades_snapshot"]:
+            data = row["grades_snapshot"]
+            return data if isinstance(data, dict) else json.loads(data)
+        return {}
 
     # ── Display settings ──────────────────────────────────────────────────────
 
-    def get_display_settings(self, user_id: int) -> dict:
-        return dict(self._users.get(str(user_id), {}).get("display_settings", {}))
+    async def get_display_settings(self, user_id: int) -> dict:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT display_settings FROM users WHERE user_id=$1", user_id
+            )
+        if row and row["display_settings"]:
+            data = row["display_settings"]
+            return dict(data) if isinstance(data, dict) else json.loads(data)
+        return {}
 
-    def set_display_settings(self, user_id: int, settings: dict):
-        key = str(user_id)
-        if key not in self._users:
-            self._users[key] = {}
-        self._users[key]["display_settings"] = settings
-        self._save_users()
-
-    # ── Monitor last_check ────────────────────────────────────────────────────
-
-    def set_last_check(self, user_id: int, timestamp: float):
-        key = str(user_id)
-        if key not in self._monitor:
-            self._monitor[key] = {"interval_minutes": 15, "whitelist": "", "active": False}
-        self._monitor[key]["last_check"] = timestamp
-        self._save_monitor()
+    async def set_display_settings(self, user_id: int, settings: dict):
+        async with self._pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, display_settings)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET display_settings = EXCLUDED.display_settings,
+                        updated_at = NOW()
+            """, user_id, json.dumps(settings, ensure_ascii=False))
