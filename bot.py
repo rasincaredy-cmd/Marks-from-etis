@@ -607,14 +607,14 @@ async def cmd_users(message: Message):
     if not users:
         await message.answer("Пользователей нет.")
         return
-    lines = [f"👥 *Пользователи ({len(users)}):*\n"]
+    lines = [f"👥 Пользователи ({len(users)}):\n"]
     for u in users:
-        uid  = u["user_id"]
-        name = u.get("first_name") or ""
+        uid   = u["user_id"]
+        name  = u.get("first_name") or ""
         uname = f"@{u['username']}" if u.get("username") else "нет username"
-        dt = u["created_at"].strftime("%d.%m.%Y %H:%M") if u.get("created_at") else ""
-        lines.append(f"`{uid}` {name} {uname} — {dt}")
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+        dt    = u["created_at"].strftime("%d.%m.%Y %H:%M") if u.get("created_at") else ""
+        lines.append(f"{uid} | {name} | {uname} | {dt}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("send"))
