@@ -180,7 +180,7 @@ class ETISParser:
                     "theme":          theme,
                     "current_score":  _to_int(score_text),
                     "passing_score":  _to_int(cells[4].get_text(strip=True)),
-                    "rating_score":   _to_int(cells[5].get_text(strip=True)),
+                    "rating_score":   _to_int(cells[3].get_text(strip=True)),
                     "max_score":      _to_int(cells[6].get_text(strip=True)),
                     "work_type":      cells[1].get_text(strip=True) if len(cells) > 1 else "",
                     "control_type":   cells[2].get_text(strip=True) if len(cells) > 2 else "",
