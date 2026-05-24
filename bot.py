@@ -513,27 +513,27 @@ async def _show_rating(cb: CallbackQuery, term: int | None):
         return
 
     label = f"Триместр {term}" if term else "текущий триместр"
-    place = data.get("place")
-    total = data.get("total")
-    score = data.get("score")
+    group   = data.get("group")
+    college = data.get("college")
 
-    if place is None and not data.get("rows"):
+    if not group and not college:
         await _safe_edit(cb.message,
-            f"📭 Рейтинг за {label} недоступен или пока не сформирован.",
+            f"📭 Рейтинг за {label} недоступен.",
             reply_markup=rating_kb(term))
         return
 
-    place_str = f"*{place}* из {total}" if (place and total) else (f"*{place}*" if place else "не определено")
-    score_str = f"{score:.2f}" if score is not None else "—"
-    text = f"🏆 *Рейтинг ({label})*\n\nМесто: {place_str}\nБалл: {score_str}\n"
+    def fmt_entry(e: dict) -> str:
+        if e["place"] and e["total"]:
+            return f"*{e['place']}* из {e['total']}"
+        elif e["total"]:
+            return f"не сформирован (всего {e['total']})"
+        return "не сформирован"
 
-    rows = data.get("rows", [])
-    if rows:
-        text += "\n*Топ участников:*\n"
-        for r in rows[:10]:
-            marker = "👉 " if r["place"] == place else "    "
-            sc = f"{r['score']:.2f}" if r["score"] is not None else "—"
-            text += f"{marker}{r['place']}. {r['name']} — {sc}\n"
+    text = f"🏆 *Рейтинг ({label})*\n\n"
+    if group:
+        text += f"👥 {group['name']}\n    Место: {fmt_entry(group)}\n\n"
+    if college:
+        text += f"🏫 {college['name']}\n    Место: {fmt_entry(college)}\n"
 
     await _send_long(cb, text, rating_kb(term))
 

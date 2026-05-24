@@ -332,52 +332,45 @@ class ETISParser:
         return self._parse_rating(html)
 
     def _parse_rating(self, html: str) -> dict:
+        """
+        Страница рейтинга ПГНИУ показывает только место студента:
+        Таблица с двумя колонками: [Название уровня] [X из Y]
+        Строки: место в группе, место в колледже.
+        """
         soup = BeautifulSoup(html, "html.parser")
-        result = {"place": None, "total": None, "score": None, "rows": []}
+        result = {"group": None, "college": None}
+        # group/college = {"name": str, "place": int|None, "total": int|None}
 
-        # Ищем строку с текущим студентом — обычно выделена жирным или классом
-        # Формат таблицы: Место | ФИО | Балл
         table = soup.find("table", class_="common")
-        if not table:
-            # Попробуем любую таблицу
-            table = soup.find("table")
         if not table:
             return result
 
-        rows = table.find_all("tr")
-        total = 0
-        for tr in rows:
+        for tr in table.find_all("tr"):
             cells = tr.find_all("td")
-            if len(cells) < 3:
+            if len(cells) < 2:
                 continue
-            place_text = cells[0].get_text(strip=True)
-            name_text  = cells[1].get_text(strip=True)
-            score_text = cells[2].get_text(strip=True)
-
-            if not place_text.isdigit():
+            name  = cells[0].get_text(strip=True)
+            place_str = cells[1].get_text(strip=True)  # "X из Y" или "0 из Y"
+            if not name or not place_str:
                 continue
-            place = int(place_text)
-            total = max(total, place)
 
-            score = None
-            try:
-                score = float(score_text.replace(",", "."))
-            except ValueError:
-                pass
+            place, total = None, None
+            # Парсим "X из Y"
+            m = re.match(r"(\d+)\s+из\s+(\d+)", place_str)
+            if m:
+                place = int(m.group(1))
+                total = int(m.group(2))
+                if place == 0:
+                    place = None  # 0 = рейтинг не сформирован
 
-            result["rows"].append({"place": place, "name": name_text, "score": score})
+            entry = {"name": name, "place": place, "total": total}
 
-            # Текущий студент — выделен жирным (тег b/strong) или классом "current"
-            is_current = (
-                bool(tr.find("b") or tr.find("strong")) or
-                "current" in (tr.get("class") or []) or
-                "bold"    in (tr.get("style") or "")
-            )
-            if is_current:
-                result["place"] = place
-                result["score"] = score
+            # Первая строка — группа, вторая — колледж (по порядку)
+            if result["group"] is None:
+                result["group"] = entry
+            elif result["college"] is None:
+                result["college"] = entry
 
-        result["total"] = total if total > 0 else None
         return result
 
 
