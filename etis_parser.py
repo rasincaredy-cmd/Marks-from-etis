@@ -23,6 +23,7 @@ BASE_URL    = "https://student.psu.ru/pls/stu_cus_et"
 LOGIN_URL   = f"{BASE_URL}/stu.login"
 GRADES_URL  = f"{BASE_URL}/stu.signs"
 TIMETABLE_URL = f"{BASE_URL}/stu.timetable"
+RATING_URL    = f"{BASE_URL}/stu.rating"
 
 HEADERS = {
     "User-Agent": (
@@ -172,21 +173,27 @@ class ETISParser:
                 theme_tag = cells[0].find("a")
                 theme = theme_tag.get_text(strip=True) if theme_tag else cells[0].get_text(strip=True)
 
+                rating_score = _to_int(cells[5].get_text(strip=True))
+                max_score    = _to_int(cells[6].get_text(strip=True))
+                # Необъективируемый контроль: нет максимального балла в рейтинге
+                is_non_ratable = (max_score is None or max_score == 0)
+
                 rows_data.append({
                     # cells[3] = Оценка (набранный балл за работу)
                     # cells[4] = Проходной балл
                     # cells[5] = Балл в рейтинг текущий (фактически зачтено)
-                    # cells[6] = Балл в рейтинг максимальный (сколько можно за КТ)
-                    "theme":          theme,
-                    "current_score":  _to_int(score_text),
-                    "passing_score":  _to_int(cells[4].get_text(strip=True)),
-                    "rating_score":   _to_int(cells[3].get_text(strip=True)),
-                    "max_score":      _to_int(cells[6].get_text(strip=True)),
-                    "work_type":      cells[1].get_text(strip=True) if len(cells) > 1 else "",
-                    "control_type":   cells[2].get_text(strip=True) if len(cells) > 2 else "",
-                    "date":           cells[7].get_text(strip=True) if len(cells) > 7 else "",
-                    "teacher":        cells[8].get_text(strip=True) if len(cells) > 8 else "",
-                    "is_red":         "color:red" in (tr.get("style") or ""),
+                    # cells[6] = Балл в рейтинг максимальный (0 = необъективируемый)
+                    "theme":           theme,
+                    "current_score":   _to_int(score_text),
+                    "passing_score":   _to_int(cells[4].get_text(strip=True)),
+                    "rating_score":    rating_score,
+                    "max_score":       max_score,
+                    "is_non_ratable":  is_non_ratable,
+                    "work_type":       cells[1].get_text(strip=True) if len(cells) > 1 else "",
+                    "control_type":    cells[2].get_text(strip=True) if len(cells) > 2 else "",
+                    "date":            cells[7].get_text(strip=True) if len(cells) > 7 else "",
+                    "teacher":         cells[8].get_text(strip=True) if len(cells) > 8 else "",
+                    "is_red":          "color:red" in (tr.get("style") or ""),
                 })
 
             if rows_data:
@@ -301,6 +308,75 @@ class ETISParser:
             "week_label": week_label,
             "days":       days,
         }
+
+
+    # ── Rating ───────────────────────────────────────────────────────────────────
+
+    async def get_rating(self, term: int | None = None) -> dict:
+        """
+        Возвращает {
+            place: int | None,
+            total: int | None,
+            score: float | None,
+            rows: [{place, name, score}]  # топ участников если доступно
+        }
+        """
+        params: dict = {}
+        if term is not None:
+            params["p_term"] = str(term)
+        html = await self._fetch(RATING_URL, params=params)
+        if html is None:
+            return {"place": None, "total": None, "score": None, "rows": []}
+        return self._parse_rating(html)
+
+    def _parse_rating(self, html: str) -> dict:
+        soup = BeautifulSoup(html, "html.parser")
+        result = {"place": None, "total": None, "score": None, "rows": []}
+
+        # Ищем строку с текущим студентом — обычно выделена жирным или классом
+        # Формат таблицы: Место | ФИО | Балл
+        table = soup.find("table", class_="common")
+        if not table:
+            # Попробуем любую таблицу
+            table = soup.find("table")
+        if not table:
+            return result
+
+        rows = table.find_all("tr")
+        total = 0
+        for tr in rows:
+            cells = tr.find_all("td")
+            if len(cells) < 3:
+                continue
+            place_text = cells[0].get_text(strip=True)
+            name_text  = cells[1].get_text(strip=True)
+            score_text = cells[2].get_text(strip=True)
+
+            if not place_text.isdigit():
+                continue
+            place = int(place_text)
+            total = max(total, place)
+
+            score = None
+            try:
+                score = float(score_text.replace(",", "."))
+            except ValueError:
+                pass
+
+            result["rows"].append({"place": place, "name": name_text, "score": score})
+
+            # Текущий студент — выделен жирным (тег b/strong) или классом "current"
+            is_current = (
+                bool(tr.find("b") or tr.find("strong")) or
+                "current" in (tr.get("class") or []) or
+                "bold"    in (tr.get("style") or "")
+            )
+            if is_current:
+                result["place"] = place
+                result["score"] = score
+
+        result["total"] = total if total > 0 else None
+        return result
 
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────

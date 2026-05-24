@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
-from etis_parser import ETISParser, GRADES_URL
+from etis_parser import ETISParser, GRADES_URL, RATING_URL
 from storage import UserStorage, get_pool, init_db
 from monitor import GradeMonitor
 
@@ -63,7 +63,8 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔐 Войти в ЕТИС",        callback_data="login")],
         [InlineKeyboardButton(text="📊 Оценки",               callback_data="grades_current"),
          InlineKeyboardButton(text="📅 Расписание",           callback_data="timetable")],
-        [InlineKeyboardButton(text="🔔 Мониторинг оценок",    callback_data="monitor_menu")],
+        [InlineKeyboardButton(text="🏆 Рейтинг",             callback_data="rating_current"),
+         InlineKeyboardButton(text="🔔 Мониторинг",          callback_data="monitor_menu")],
     ])
 
 def grades_kb() -> InlineKeyboardMarkup:
@@ -366,14 +367,22 @@ async def _show_grades(cb: CallbackQuery, term: int | None):
     text = f"📊 *Оценки ({label})*\n\n"
 
     for subject, rows in grades.items():
-        total_rating = sum(r["rating_score"] for r in rows if r.get("rating_score") is not None)
-        total_max    = sum(r["max_score"]    for r in rows if r.get("max_score")    is not None)
+        total_rating = sum(r["rating_score"] for r in rows
+                          if r.get("rating_score") is not None and not r.get("is_non_ratable"))
+        total_max    = sum(r["max_score"]    for r in rows
+                          if r.get("max_score")    is not None and not r.get("is_non_ratable"))
         text += f"📌 *{subject}*\n"
         for i, row in enumerate(rows, 1):
-            r_str = str(row["rating_score"]) if row.get("rating_score") is not None else "—"
-            m_str = str(row["max_score"])    if row.get("max_score")    is not None else "—"
-            p_str = str(row["passing_score"])if row.get("passing_score")is not None else "—"
-            line = f"  КТ{i}: {r_str}/{m_str} (проход: {p_str})"
+            non_rat = row.get("is_non_ratable", False)
+            if non_rat:
+                score = row.get("current_score")
+                score_str = str(score) if score is not None else "—"
+                line = f"  КТ{i}: {score_str} 📝"
+            else:
+                r_str = str(row["rating_score"]) if row.get("rating_score") is not None else "—"
+                m_str = str(row["max_score"])    if row.get("max_score")    is not None else "—"
+                p_str = str(row["passing_score"])if row.get("passing_score")is not None else "—"
+                line = f"  КТ{i}: {r_str}/{m_str} (проход: {p_str})"
             if show_work_type    and row.get("work_type"):    line += f" | {row['work_type']}"
             if show_control_type and row.get("control_type"): line += f" | {row['control_type']}"
             if row.get("date"):   line += f" {row['date']}"
@@ -447,6 +456,86 @@ async def _show_timetable(cb: CallbackQuery, week: int | None):
         text += "\n"
 
     await _send_long(cb, text, timetable_nav_kb(current_week))
+
+
+# ─── Rating ───────────────────────────────────────────────────────────────────
+
+def rating_kb(term: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    if term is not None:
+        rows.append([InlineKeyboardButton(text="📌 Текущий триместр", callback_data="rating_current")])
+    rows.append([InlineKeyboardButton(text="📚 Другой триместр", callback_data="rating_pick_term")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def rating_term_kb() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"Триместр {t}", callback_data=f"rating_term_{t}")]
+            for t in range(1, 7)]
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "rating_current")
+async def cb_rating_current(cb: CallbackQuery):
+    await _show_rating(cb, term=None)
+
+
+@dp.callback_query(F.data == "rating_pick_term")
+async def cb_rating_pick_term(cb: CallbackQuery):
+    await _send_menu(cb, "Выберите триместр:", rating_term_kb())
+
+
+@dp.callback_query(F.data.startswith("rating_term_"))
+async def cb_rating_term(cb: CallbackQuery):
+    term = int(cb.data.split("_")[-1])
+    await _show_rating(cb, term=term)
+
+
+async def _show_rating(cb: CallbackQuery, term: int | None):
+    await _clear_extra_chunks(cb.from_user.id, cb.message.chat.id)
+    ok = await _safe_edit(cb.message, "⏳ Загружаю рейтинг...")
+    if not ok:
+        msg = await cb.message.answer("⏳ Загружаю рейтинг...")
+        cb = cb.model_copy(update={"message": msg})
+    await cb.answer()
+
+    parser = await ensure_logged_in(cb.from_user.id)
+    if not parser:
+        await _safe_edit(cb.message, "❌ Не могу войти в ЕТИС. Войдите снова.",
+                         reply_markup=main_menu_kb())
+        return
+
+    try:
+        data = await parser.get_rating(term=term)
+    except Exception as e:
+        logger.error("Rating error: %s", e)
+        await _safe_edit(cb.message, "❌ Ошибка при загрузке рейтинга.", reply_markup=back_kb())
+        return
+
+    label = f"Триместр {term}" if term else "текущий триместр"
+    place = data.get("place")
+    total = data.get("total")
+    score = data.get("score")
+
+    if place is None and not data.get("rows"):
+        await _safe_edit(cb.message,
+            f"📭 Рейтинг за {label} недоступен или пока не сформирован.",
+            reply_markup=rating_kb(term))
+        return
+
+    place_str = f"*{place}* из {total}" if (place and total) else (f"*{place}*" if place else "не определено")
+    score_str = f"{score:.2f}" if score is not None else "—"
+    text = f"🏆 *Рейтинг ({label})*\n\nМесто: {place_str}\nБалл: {score_str}\n"
+
+    rows = data.get("rows", [])
+    if rows:
+        text += "\n*Топ участников:*\n"
+        for r in rows[:10]:
+            marker = "👉 " if r["place"] == place else "    "
+            sc = f"{r['score']:.2f}" if r["score"] is not None else "—"
+            text += f"{marker}{r['place']}. {r['name']} — {sc}\n"
+
+    await _send_long(cb, text, rating_kb(term))
 
 
 # ─── Display settings ─────────────────────────────────────────────────────────
@@ -621,18 +710,26 @@ async def cmd_users(message: Message):
 async def cmd_send(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("Введите user\\_id получателя:", parse_mode="Markdown")
+    await message.answer(
+        "Кому отправить?\n"
+        "• Числовой user_id — одному\n"
+        "• `all` — рассылка всем",
+        parse_mode="Markdown"
+    )
     await state.set_state(AdminStates.waiting_send_id)
 
 
 @dp.message(AdminStates.waiting_send_id)
 async def process_send_id(message: Message, state: FSMContext):
-    try:
-        uid = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Введите числовой user_id.")
-        return
-    await state.update_data(target_id=uid)
+    raw = message.text.strip().lower()
+    if raw == "all":
+        await state.update_data(target_id="all")
+    else:
+        try:
+            await state.update_data(target_id=int(raw))
+        except ValueError:
+            await message.answer("❌ Введите числовой user_id или all.")
+            return
     await message.answer("Введите текст сообщения:")
     await state.set_state(AdminStates.waiting_send_text)
 
@@ -641,12 +738,26 @@ async def process_send_id(message: Message, state: FSMContext):
 async def process_send_text(message: Message, state: FSMContext):
     data = await state.get_data()
     target_id = data["target_id"]
+    text = message.text
     await state.clear()
-    try:
-        await bot.send_message(target_id, message.text)
-        await message.answer(f"✅ Отправлено пользователю `{target_id}`", parse_mode="Markdown")
-    except Exception as e:
-        await message.answer(f"❌ Не удалось отправить: {e}")
+
+    if target_id == "all":
+        user_ids = await storage.all_user_ids()
+        ok, fail = 0, 0
+        for uid in user_ids:
+            try:
+                await bot.send_message(uid, text)
+                ok += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.05)
+        await message.answer(f"✅ Рассылка завершена: {ok} доставлено, {fail} ошибок.")
+    else:
+        try:
+            await bot.send_message(target_id, text)
+            await message.answer(f"✅ Отправлено пользователю {target_id}")
+        except Exception as e:
+            await message.answer(f"❌ Не удалось отправить: {e}")
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
