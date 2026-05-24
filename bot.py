@@ -710,12 +710,7 @@ async def cmd_users(message: Message):
 async def cmd_send(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await message.answer(
-        "Кому отправить?\n"
-        "• Числовой user_id — одному\n"
-        "• `all` — рассылка всем",
-        parse_mode="Markdown"
-    )
+    await message.answer("Кому отправить?\nЧисловой user_id — одному\nall — рассылка всем")
     await state.set_state(AdminStates.waiting_send_id)
 
 

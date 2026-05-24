@@ -314,17 +314,19 @@ class ETISParser:
 
     async def get_rating(self, term: int | None = None) -> dict:
         """
+        Рейтинг: stu.signs?p_mode=rating&p_term=N
         Возвращает {
             place: int | None,
             total: int | None,
             score: float | None,
-            rows: [{place, name, score}]  # топ участников если доступно
+            rows: [{place, name, score}]
         }
         """
-        params: dict = {}
+        # Рейтинг — та же страница stu.signs, но p_mode=rating
+        params: dict = {"p_mode": "rating"}
         if term is not None:
             params["p_term"] = str(term)
-        html = await self._fetch(RATING_URL, params=params)
+        html = await self._fetch(GRADES_URL, params=params)
         if html is None:
             return {"place": None, "total": None, "score": None, "rows": []}
         return self._parse_rating(html)
