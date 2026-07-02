@@ -104,7 +104,7 @@ def monitor_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 
 def grades_settings_kb(s: dict) -> InlineKeyboardMarkup:
     def btn(key: str, label: str) -> InlineKeyboardButton:
-        icon = "✅" if s.get(key, False) else "☐"
+        icon = "✅" if s.get(key, False) else "❌"
         return InlineKeyboardButton(text=f"{icon} {label}", callback_data=f"gs_toggle_{key}")
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("show_theme",        "Тема КТ")],
