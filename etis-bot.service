@@ -1,0 +1,25 @@
+[Unit]
+Description=ETIS grades Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/etis-bot
+EnvironmentFile=/etc/etis-bot.env
+Environment=TZ=Europe/Moscow
+Environment=DB_PATH=/opt/etis-bot/data/etis_bot.sqlite3
+ExecStart=/opt/etis-bot/.venv/bin/python /opt/etis-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# базовая изоляция: боту нужен только свой каталог и сеть
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

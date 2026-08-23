@@ -1,7 +1,7 @@
 """
 Bot configuration.
 Токен читается из переменной окружения BOT_TOKEN.
-На Railway: Settings -> Variables -> BOT_TOKEN = твой_токен
+На сервере: переменные заданы в юните systemd (/etc/systemd/system/etis-bot.service).
 Локально: создай файл .env рядом с ботом со строкой BOT_TOKEN=твой_токен
 """
 
@@ -22,6 +22,6 @@ BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise ValueError(
         "Токен не найден!\n"
-        "На Railway: добавь BOT_TOKEN в Variables\n"
+        "На сервере: пропиши BOT_TOKEN в юните systemd\n"
         "Локально: создай .env файл со строкой BOT_TOKEN=твой_токен"
     )
